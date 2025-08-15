@@ -1,0 +1,840 @@
+        C:\Users\Maria Eduarda\Downloads\SISTEMA_CAIXA_-main (1)\SISTEMA_CAIXA_-main\sistema\app.py
+        import streamlit as st
+        from relatorios import aba_relatorios
+
+        from db import (
+            criar_tabela_produtos,
+            criar_tabela_vendas,
+            criar_tabela_vendas_nova,
+            criar_tabela_contas,
+            alterar_tabela_produtos,
+            criar_tabela_configuracoes,
+            garantir_colunas_pagamento
+        )
+
+        from estoque import (
+            aba_estoque,
+            aba_configuracao_estoque_minimo,
+            aba_alerta_estoque_minimo
+        )
+
+        from movimentacao_caixa import aba_movimentacao_caixa
+        from fechamento import aba_fechamento
+        from contas import aba_contas
+
+        # Criar tabelas no início
+        criar_tabela_produtos()
+        criar_tabela_contas()
+        criar_tabela_vendas_nova()
+        alterar_tabela_produtos()
+        criar_tabela_configuracoes()
+        garantir_colunas_pagamento()  
+        # Menu lateral principal
+        st.sidebar.title("📋 Menu do Sistema de Caixa")
+        aba = st.sidebar.selectbox("Escolha uma aba:", ["Estoque", "Movimentação / Caixa", "Fechamento", "Contas a Pagar", "Relatórios"])
+
+        # Direcionamento
+        if aba == "Estoque":
+            subaba = st.sidebar.radio("Função do Estoque:", ["📦 Controle de Produtos", "⚙️ Configurar Estoque Mínimo", "🚨 Alerta Estoque Mínimo"])
+
+            if subaba == "📦 Controle de Produtos":
+                aba_estoque()
+            elif subaba == "⚙️ Configurar Estoque Mínimo":
+                aba_configuracao_estoque_minimo()
+            elif subaba == "🚨 Alerta Estoque Mínimo":
+                aba_alerta_estoque_minimo()
+
+        elif aba == "Movimentação / Caixa":
+            aba_movimentacao_caixa()
+
+        elif aba == "Fechamento":
+            aba_fechamento()
+
+        elif aba == "Contas a Pagar":
+            aba_contas()
+
+        elif aba == "Relatórios":
+            aba_relatorios()
+
+
+        C:\Users\Maria Eduarda\Downloads\SISTEMA_CAIXA_-main (1)\SISTEMA_CAIXA_-main\sistema\caixa.py
+
+        import streamlit as st
+        from db import listar_produtos, registrar_venda
+
+        def aba_caixa():
+            st.header("💰 Caixa (PDV)")
+
+            produtos = listar_produtos()
+            nomes_produtos = [p[1] for p in produtos]
+            estoque_dict = {p[1]: {"estoque": p[2], "valor": p[3]} for p in produtos}
+
+            if "carrinho" not in st.session_state:
+                st.session_state.carrinho = []
+
+            st.subheader("Adicionar item à venda")
+            with st.form("form_caixa"):
+                nome = st.selectbox("Produto", nomes_produtos)
+                quantidade = st.number_input("Quantidade", min_value=1, step=1)
+                adicionar = st.form_submit_button("Adicionar ao carrinho")
+
+                if adicionar:
+                    if estoque_dict[nome]["estoque"] < quantidade:
+                        st.warning(f"Estoque insuficiente: disponível {estoque_dict[nome]['estoque']}")
+                    else:
+                        st.session_state.carrinho.append({
+                            "nome": nome,
+                            "quantidade": quantidade,
+                            "valor_unitario": estoque_dict[nome]["valor"],
+                            "subtotal": round(quantidade * estoque_dict[nome]["valor"], 2)
+                        })
+
+            # Mostrar carrinho
+            if st.session_state.carrinho:
+                st.subheader("Itens no carrinho")
+                total = 0
+                for i, item in enumerate(st.session_state.carrinho):
+                    st.write(f"{item['quantidade']}x {item['nome']} - R$ {item['subtotal']:.2f}")
+                    total += item["subtotal"]
+
+                st.success(f"Total: R$ {total:.2f}")
+                if st.button("Finalizar venda"):
+                    try:
+                        for item in st.session_state.carrinho:
+                            registrar_venda(item["nome"], item["quantidade"])
+                        st.success("Venda finalizada com sucesso!")
+                        st.session_state.carrinho = []
+                    except Exception as e:
+                        st.error(str(e))
+            else:
+                st.info("Nenhum item no carrinho.")
+        C:\Users\Maria Eduarda\Downloads\SISTEMA_CAIXA_-main (1)\SISTEMA_CAIXA_-main\sistema\db.py
+
+        # db.py
+        import os, sqlite3
+
+        # Pasta de dados do usuário (Windows): C:\Users\<user>\AppData\Roaming\SISTEMA_CAIXA
+        APP_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "SISTEMA_CAIXA")
+        os.makedirs(APP_DIR, exist_ok=True)
+        DB_PATH = os.path.join(APP_DIR, "caixa.db")
+
+        def conectar():
+            return sqlite3.connect(DB_PATH)
+
+        def criar_tabela_produtos():
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS produtos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    codigo_barras TEXT,
+                    nome TEXT,
+                    quantidade INTEGER,
+                    valor_unitario REAL,
+                    estoque_minimo_personalizado INTEGER DEFAULT 0
+                )
+            """)
+            conn.commit()
+            conn.close()
+
+        # db.py  ── função central de cadastro/atualização
+        # ─── db.py ───
+        def adicionar_ou_atualizar_produto(codigo_barras, nome,
+                                        quantidade, valor_unitario,
+                                        estoque_minimo_personalizado=0):
+
+            # ▸ 1. Normaliza entrada ─ transforma "" em None (NULL no banco)
+            codigo_barras = (codigo_barras or '').strip()
+            if codigo_barras == '':
+                codigo_barras = None          # ← NULL não conflita com UNIQUE
+
+            conn = conectar()
+            cur  = conn.cursor()
+
+            # ▸ 2. Procura primeiro pelo código-de-barras (se existir)
+            if codigo_barras is not None:
+                cur.execute("SELECT id FROM produtos WHERE codigo_barras = ?", (codigo_barras,))
+            else:                             # senão, procura pelo NOME
+                cur.execute("SELECT id FROM produtos WHERE nome = ?", (nome,))
+
+            row = cur.fetchone()
+
+            if row:                                        # → já existe: somar quantidade
+                cur.execute("""
+                    UPDATE produtos
+                    SET quantidade                  = quantidade + ?,
+                        valor_unitario              = ?,
+                        nome                        = ?,
+                        estoque_minimo_personalizado = ?
+                    WHERE id = ?
+                """, (quantidade, valor_unitario, nome,
+                    estoque_minimo_personalizado, row[0]))
+            else:                                          # → não existe: inserir
+                cur.execute("""
+                    INSERT INTO produtos
+                        (codigo_barras, nome, quantidade,
+                        valor_unitario, estoque_minimo_personalizado)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (codigo_barras, nome, quantidade,
+                    valor_unitario, estoque_minimo_personalizado))
+
+            conn.commit()
+            conn.close()
+
+
+
+        def listar_produtos():
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, codigo_barras, nome, quantidade, valor_unitario, estoque_minimo_personalizado FROM produtos")
+            produtos = cursor.fetchall()
+            conn.close()
+            return produtos
+
+
+
+
+
+        # Cria tabela de vendas
+        def criar_tabela_vendas():
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS vendas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome_produto TEXT NOT NULL,
+                    quantidade INTEGER,
+                    valor_unitario REAL,
+                    data_venda TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+            conn.close()
+
+        # Registrar uma venda
+        def registrar_venda(nome, quantidade):
+            conn = conectar()
+            cursor = conn.cursor()
+            
+            # Buscar valor e quantidade atuais do produto
+            cursor.execute("SELECT quantidade, valor_unitario FROM produtos WHERE nome = ?", (nome,))
+            resultado = cursor.fetchone()
+            if resultado:
+                estoque_atual, valor_unitario = resultado
+                if estoque_atual >= quantidade:
+                    # Registrar venda
+                    cursor.execute("""
+                        INSERT INTO vendas (nome_produto, quantidade, valor_unitario)
+                        VALUES (?, ?, ?)
+                    """, (nome, quantidade, valor_unitario))
+                    # Atualizar estoque
+                    cursor.execute("""
+                        UPDATE produtos SET quantidade = quantidade - ? WHERE nome = ?
+                    """, (quantidade, nome))
+                    conn.commit()
+                else:
+                    conn.close()
+                    raise ValueError(f"Estoque insuficiente! Disponível: {estoque_atual}")
+            else:
+                conn.close()
+                raise ValueError("Produto não encontrado.")
+            conn.close()
+
+        # Listar vendas
+        def listar_vendas():
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM vendas ORDER BY data_venda DESC")
+            vendas = cursor.fetchall()
+            conn.close()
+            return vendas
+        # Criação da tabela de contas
+        def criar_tabela_contas():
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS contas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    descricao TEXT NOT NULL,
+                    valor REAL,
+                    vencimento DATE
+                );
+            """)
+            conn.commit()
+            conn.close()
+
+        # Adicionar uma conta
+        def adicionar_conta(descricao, valor, vencimento):
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO contas (descricao, valor, vencimento)
+                VALUES (?, ?, ?)
+            """, (descricao, valor, vencimento))
+            conn.commit()
+            conn.close()
+
+        # Listar todas as contas
+        def listar_contas():
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM contas ORDER BY vencimento ASC")
+            contas = cursor.fetchall()
+            conn.close()
+            return contas
+        # NOVAS TABELAS
+        def criar_tabela_vendas_nova():
+            conn = conectar()
+            cur = conn.cursor()
+
+            # vendas com status_pagamento e nome_cliente
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS vendas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_venda TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    valor_total REAL,
+                    status_pagamento TEXT DEFAULT 'feito',
+                    nome_cliente TEXT
+                );
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS itens_venda (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    venda_id INTEGER,
+                    nome_produto TEXT,
+                    quantidade INTEGER,
+                    valor_unitario REAL,
+                    FOREIGN KEY(venda_id) REFERENCES vendas(id)
+                );
+            """)
+            conn.commit()
+            conn.close()
+
+
+        def garantir_colunas_pagamento():
+            """Garante que colunas status_pagamento e nome_cliente existam na tabela vendas (migração)."""
+            conn = conectar()
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(vendas)")
+            cols = {row[1] for row in cur.fetchall()}
+
+            if "status_pagamento" not in cols:
+                cur.execute("ALTER TABLE vendas ADD COLUMN status_pagamento TEXT DEFAULT 'feito'")
+            if "nome_cliente" not in cols:
+                cur.execute("ALTER TABLE vendas ADD COLUMN nome_cliente TEXT")
+
+            conn.commit()
+            conn.close()
+
+
+
+
+        def registrar_venda_completa(carrinho, status_pagamento="feito", nome_cliente=None):
+            conn = conectar()
+            cur = conn.cursor()
+
+            total = sum(item['quantidade'] * item['valor_unitario'] for item in carrinho)
+
+            # Criar venda com status e cliente (cliente só se pendente)
+            cur.execute(
+                "INSERT INTO vendas (valor_total, status_pagamento, nome_cliente) VALUES (?, ?, ?)",
+                (total, status_pagamento, nome_cliente if status_pagamento == "pendente" else None)
+            )
+            venda_id = cur.lastrowid
+
+            for item in carrinho:
+                cur.execute("""
+                    INSERT INTO itens_venda (venda_id, nome_produto, quantidade, valor_unitario)
+                    VALUES (?, ?, ?, ?)
+                """, (venda_id, item['nome'], item['quantidade'], item['valor_unitario']))
+
+                cur.execute("""
+                    UPDATE produtos SET quantidade = quantidade - ?
+                    WHERE nome = ?
+                """, (item['quantidade'], item['nome']))
+
+            conn.commit()
+            conn.close()
+        def marcar_venda_como_paga(venda_id):
+            conn = conectar()
+            cur = conn.cursor()
+            cur.execute("UPDATE vendas SET status_pagamento='feito' WHERE id=?", (venda_id,))
+            conn.commit()
+            conn.close()
+
+        def listar_vendas_pendentes():
+            conn = conectar()
+            cur = conn.cursor()
+            cur.execute("SELECT id, data_venda, valor_total, nome_cliente FROM vendas WHERE status_pagamento='pendente' ORDER BY data_venda DESC")
+            rows = cur.fetchall()
+            conn.close()
+            return rows
+
+        # Buscar histórico de vendas
+        def listar_vendas_com_itens():
+            conn = conectar()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT v.id, v.data_venda, v.valor_total, i.nome_produto, i.quantidade, i.valor_unitario
+                FROM vendas v
+                JOIN itens_venda i ON v.id = i.venda_id
+                ORDER BY v.data_venda DESC
+            """)
+            vendas = cursor.fetchall()
+            conn.close()
+            return vendas
+
+        def atualizar_produto_por_id(id_produto, nome, quantidade, valor_unitario, estoque_minimo):
+            conn = conectar()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE produtos 
+                SET nome = ?, quantidade = ?, valor_unitario = ?, estoque_minimo_personalizado = ?
+                WHERE id = ?
+            """, (nome, quantidade, valor_unitario, estoque_minimo, id_produto))
+            conn.commit()
+            conn.close()
+
+        def alterar_tabela_produtos():
+            conn = conectar()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("ALTER TABLE produtos ADD COLUMN estoque_minimo_personalizado INTEGER DEFAULT 0")
+            except:
+                pass  # Já existe
+            conn.commit()
+            conn.close()
+
+        def criar_tabela_configuracoes():
+            conn = conectar()
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS configuracoes (
+                    chave TEXT PRIMARY KEY,
+                    valor INTEGER
+                )
+            """)
+
+            # Inserir estoque mínimo padrão se ainda não existir
+            cursor.execute("""
+                INSERT OR IGNORE INTO configuracoes (chave, valor)
+                VALUES ('estoque_minimo_padrao', 5)
+            """)
+
+            conn.commit()
+            conn.close()
+        C:\Users\Maria Eduarda\Downloads\SISTEMA_CAIXA_-main (1)\SISTEMA_CAIXA_-main\sistema\estoque.py
+        import streamlit as st
+        from db import listar_produtos, conectar, atualizar_produto_por_id, adicionar_ou_atualizar_produto
+        import os
+
+        # Pasta de dados do usuário + arquivo global
+        APP_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "SISTEMA_CAIXA")
+        os.makedirs(APP_DIR, exist_ok=True)
+        ESTOQUE_GLOBAL_PATH = os.path.join(APP_DIR, "estoque_minimo_global.txt")
+
+
+        # 🟢 Funções para controle de estoque mínimo global
+        def obter_estoque_minimo_global():
+            if os.path.exists(ESTOQUE_GLOBAL_PATH):
+                with open(ESTOQUE_GLOBAL_PATH, "r") as f:
+                    try:
+                        return int(f.read().strip())
+                    except:
+                        return 0
+            return 0
+
+        def definir_estoque_minimo_global(valor):
+            with open(ESTOQUE_GLOBAL_PATH, "w") as f:
+                f.write(str(valor))
+
+        # 🟢 Função principal da aba de estoque
+        def aba_estoque():
+            st.header("📦 Estoque de Produtos")
+
+            # ➕ Formulário de cadastro
+            st.subheader("Cadastrar novo produto")
+            with st.form("form_produto"):
+                codigo_barras = st.text_input("Código de Barras (use o leitor)")
+                nome = st.text_input("Nome do produto")
+                quantidade = st.number_input("Quantidade", min_value=0, step=1)
+                valor = st.number_input("Valor unitário (R$)", min_value=0.0, step=0.01, format="%.2f")
+                estoque_minimo_personalizado = st.number_input("Estoque mínimo (opcional)", min_value=0, step=1)
+                submitted = st.form_submit_button("Salvar")
+                if submitted and nome:
+                    adicionar_ou_atualizar_produto(codigo_barras, nome, quantidade, valor, estoque_minimo_personalizado)
+                    st.success(f"Produto '{nome}' salvo com sucesso!")
+                    st.rerun()
+
+
+
+            # 📋 Tabela com produtos
+            st.subheader("Produtos cadastrados")
+            produtos = listar_produtos()
+
+            estoque_global_atual = obter_estoque_minimo_global()
+            if not produtos:
+                st.info("Nenhum produto cadastrado ainda.")
+                return
+
+            # Cabeçalhos da tabela
+            colunas = st.columns([2, 3, 2, 2, 2, 1])
+            with colunas[0]: st.markdown("**Código de Barras**")
+            with colunas[1]: st.markdown("**Produto**")
+            with colunas[2]: st.markdown("**Quantidade**")
+            with colunas[3]: st.markdown("**Valor Unitário (R$)**")
+            with colunas[4]: st.markdown("**Estoque Mínimo**")
+            with colunas[5]: st.markdown("**Ações**")
+
+
+
+            for produto in produtos:
+                id_produto, cod_barras, nome, quantidade, valor_unit, estoque_min = produto
+
+                if st.session_state.get("editar_id") == id_produto:
+                    col1, col2, col3, col4, col5, col6 = st.columns([2, 3, 2, 2, 2, 1])
+                    with col1:
+                        st.text_input("Código de Barras", cod_barras, disabled=True, label_visibility="collapsed")
+                    with col2:
+                        novo_nome = st.text_input("Nome", value=nome, key=f"nome_{id_produto}", label_visibility="collapsed")
+                    with col3:
+                        nova_quantidade = st.number_input("Quantidade", value=quantidade, key=f"qtd_{id_produto}", step=1, min_value=0, label_visibility="collapsed")
+                    with col4:
+                        novo_valor = st.number_input("Valor", value=valor_unit, key=f"val_{id_produto}", step=0.01, format="%.2f", min_value=0.0, label_visibility="collapsed")
+                    with col5:
+                        novo_estoque_min = st.number_input("Est. Mín.", value=estoque_min, key=f"est_{id_produto}", step=1, min_value=0, label_visibility="collapsed")
+                    with col6:
+                        if st.button("💾", key=f"salvar_{id_produto}"):
+                            atualizar_produto_por_id(id_produto, novo_nome, nova_quantidade, novo_valor, novo_estoque_min)
+                            del st.session_state["editar_id"]
+                            st.success("Produto atualizado com sucesso!")
+                            st.rerun()
+
+                        if st.button("❌", key=f"cancelar_{id_produto}"):
+                            del st.session_state["editar_id"]
+                            st.rerun()
+
+                else:
+                    col1, col2, col3, col4, col5, col6 = st.columns([2, 3, 2, 2, 2, 1])
+                    with col1: st.write(cod_barras)
+                    with col2: st.write(nome)
+                    with col3: st.write(quantidade)
+                    with col4: st.write(f"R$ {valor_unit:.2f}")
+                    with col5:
+                        if estoque_min > 0:
+                            st.write(estoque_min)
+                        else:
+                            st.write(f"Global: {estoque_global_atual}")
+                    with col6:
+                        if st.button("✏️", key=f"editar_{id_produto}"):
+                            st.session_state["editar_id"] = id_produto
+
+
+        def aba_configuracao_estoque_minimo():
+            st.subheader("⚙️ Configurar Estoque Mínimo")
+            estoque_minimo = st.number_input("Definir valor global mínimo para todos os produtos", min_value=0, step=1, value=obter_estoque_minimo_global())
+            if st.button("Salvar configuração global"):
+                definir_estoque_minimo_global(estoque_minimo)
+                st.success("Estoque mínimo global atualizado com sucesso!")
+
+        def aba_alerta_estoque_minimo():
+            st.subheader("🚨 Produtos com Estoque Mínimo Atingido")
+
+            produtos = listar_produtos()
+            estoque_min_global = obter_estoque_minimo_global()
+            alerta = []
+
+            for produto in produtos:
+                _, cod_barras, nome, quantidade, _, estoque_min = produto
+                estoque_minimo_efetivo = estoque_min if estoque_min > 0 else estoque_min_global
+                if quantidade <= estoque_minimo_efetivo:
+                    alerta.append((cod_barras, nome, quantidade, estoque_minimo_efetivo))
+
+            if not alerta:
+                st.success("Nenhum produto abaixo do estoque mínimo.")
+                return
+
+            for cod_barras, nome, qtd, min_estoque in alerta:
+                st.error(f"⚠️ {nome} ({cod_barras}) - Quantidade atual: {qtd}, Mínimo: {min_estoque}")
+        C:\Users\Maria Eduarda\Downloads\SISTEMA_CAIXA_-main (1)\SISTEMA_CAIXA_-main\sistema\fechamento.py
+        import streamlit as st
+        from db import listar_vendas_com_itens
+        from datetime import datetime, date
+
+        def aba_fechamento():
+            st.header("📆 Fechamento de Vendas do Dia")
+
+            data_selecionada = st.date_input("Selecionar data", value=date.today())
+            vendas = listar_vendas_com_itens()
+
+            vendas_do_dia = {}
+            for v in vendas:
+                venda_id = v[0]
+                data_venda = datetime.strptime(v[1], "%Y-%m-%d %H:%M:%S")
+                if data_venda.date() == data_selecionada:
+                    if venda_id not in vendas_do_dia:
+                        vendas_do_dia[venda_id] = {
+                            "data": v[1],
+                            "total": v[2],
+                            "itens": []
+                        }
+                    vendas_do_dia[venda_id]["itens"].append({
+                        "produto": v[3],
+                        "quantidade": v[4],
+                        "valor_unitario": v[5]
+                    })
+
+            if vendas_do_dia:
+                total_dia = sum([v["total"] for v in vendas_do_dia.values()])
+                st.success(f"Total vendido em {data_selecionada.strftime('%d/%m/%Y')}: R$ {total_dia:.2f}")
+
+                for venda_id, dados in sorted(vendas_do_dia.items(), reverse=True):
+                    st.markdown(f"**Venda #{venda_id}** - 🕒 {dados['data']} - 💰 Total: R$ {dados['total']:.2f}")
+                    for item in dados["itens"]:
+                        subtotal = item["quantidade"] * item["valor_unitario"]
+                        st.write(f"{item['quantidade']}x {item['produto']} - R$ {subtotal:.2f}")
+                    st.markdown("---")
+            else:
+                st.info("Nenhuma venda registrada nesta data.")
+        C:\Users\Maria Eduarda\Downloads\SISTEMA_CAIXA_-main (1)\SISTEMA_CAIXA_-main\sistema\movimentacao_caixa.py
+
+        import streamlit as st
+        from db import (
+            listar_produtos, registrar_venda_completa, listar_vendas_com_itens,
+            listar_vendas_pendentes, marcar_venda_como_paga
+        )
+
+        def aba_movimentacao_caixa():
+            st.header("🧾 Movimentação / Caixa (Venda Completa)")
+
+            produtos = listar_produtos()
+            if not produtos:
+                st.info("Cadastre produtos no estoque primeiro.")
+                return
+
+            # p = (id, codigo_barras, nome, quantidade, valor_unitario, estoque_min)
+            by_name = {p[2]: {"estoque": p[3], "valor": p[4], "codigo": p[1]} for p in produtos}
+            by_code = {
+                str(p[1]).strip(): {"nome": p[2], "estoque": p[3], "valor": p[4]}
+                for p in produtos
+                if p[1] is not None and str(p[1]).strip() != ""
+            }
+            nomes_produtos = list(by_name.keys())
+
+            if "carrinho" not in st.session_state:
+                st.session_state.carrinho = []
+
+            st.subheader("Adicionar item à venda")
+            with st.form("form_venda_completa"):
+                codigo_input = st.text_input("Código de Barras (opcional) — use o leitor")
+                nome_selecionado = st.selectbox("Produto", nomes_produtos)
+                quantidade = st.number_input("Quantidade", min_value=1, step=1)
+
+                # NOVO: status de pagamento
+                status_pg = st.selectbox("Pagamento", ["Feito", "Pendente"], index=0)
+                nome_cliente = None
+                if status_pg == "Pendente":
+                    nome_cliente = st.text_input("Nome do cliente (obrigatório quando pendente)")
+
+                adicionar = st.form_submit_button("Adicionar ao carrinho")
+
+                if adicionar:
+                    # lookup por código se preenchido
+                    if codigo_input.strip():
+                        cod = codigo_input.strip()
+                        if cod in by_code:
+                            nome = by_code[cod]["nome"]
+                            estoque = by_code[cod]["estoque"]
+                            valor = by_code[cod]["valor"]
+                        else:
+                            st.error("Código de barras não encontrado.")
+                            return
+                    else:
+                        nome = nome_selecionado
+                        estoque = by_name[nome]["estoque"]
+                        valor = by_name[nome]["valor"]
+
+                    if estoque < quantidade:
+                        st.warning(f"Estoque insuficiente: disponível {estoque}")
+                    else:
+                        st.session_state.carrinho.append({
+                            "nome": nome,
+                            "quantidade": int(quantidade),
+                            "valor_unitario": float(valor)
+                        })
+                        # Guarda a escolha do pagamento para esta venda (fora dos itens)
+                        st.session_state.status_pagamento_atual = "pendente" if status_pg == "Pendente" else "feito"
+                        st.session_state.nome_cliente_atual = nome_cliente.strip() if nome_cliente else None
+                        st.success(f"{int(quantidade)}x {nome} adicionado ao carrinho.")
+
+            # Carrinho
+            if st.session_state.carrinho:
+                st.subheader("Carrinho de Venda")
+                total = 0.0
+                for item in st.session_state.carrinho:
+                    subtotal = item["quantidade"] * item["valor_unitario"]
+                    total += subtotal
+                    st.write(f"{item['quantidade']}x {item['nome']} - R$ {subtotal:.2f}")
+                info_pg = st.session_state.get("status_pagamento_atual", "feito")
+                if info_pg == "pendente":
+                    cliente_show = st.session_state.get("nome_cliente_atual") or "(sem nome)"
+                    st.warning(f"Pagamento: PENDENTE — Cliente: {cliente_show}")
+                else:
+                    st.info("Pagamento: FEITO")
+
+                st.success(f"Total da venda: R$ {total:.2f}")
+
+                if st.button("Finalizar venda"):
+                    try:
+                        status = st.session_state.get("status_pagamento_atual", "feito")
+                        cliente = st.session_state.get("nome_cliente_atual") if status == "pendente" else None
+
+                        if status == "pendente" and (not cliente or not cliente.strip()):
+                            st.error("Informe o nome do cliente para vendas com pagamento pendente.")
+                        else:
+                            registrar_venda_completa(st.session_state.carrinho, status, cliente)
+                            st.success("Venda registrada com sucesso!")
+                            st.session_state.carrinho = []
+                            st.session_state.status_pagamento_atual = "feito"
+                            st.session_state.nome_cliente_atual = None
+                    except Exception as e:
+                        st.error(str(e))
+            else:
+                st.info("Nenhum item no carrinho.")
+
+            st.markdown("---")
+            st.subheader("📚 Histórico de Vendas")
+            vendas = listar_vendas_com_itens()
+            if vendas:
+                for venda_id in sorted({v[0] for v in vendas}, reverse=True):
+                    st.markdown(f"**Venda #{venda_id}**")
+                    for v in [v for v in vendas if v[0] == venda_id]:
+                        st.write(f"{v[4]}x {v[3]} - R$ {v[5]:.2f}")
+                    total = next(v[2] for v in vendas if v[0] == venda_id)
+                    data = next(v[1] for v in vendas if v[0] == venda_id)
+                    st.caption(f"🕒 {data} | 💰 Total: R$ {total:.2f}")
+                    st.markdown("---")
+            else:
+                st.info("Nenhuma venda registrada ainda.")
+
+            st.subheader("🧾 Pagamentos Pendentes")
+            pendentes = listar_vendas_pendentes()
+            if pendentes:
+                for vid, data, total, cliente in pendentes:
+                    cols = st.columns([6, 3, 3])
+                    with cols[0]:
+                        st.write(f"**#{vid}** — {data} — Cliente: {cliente or '(sem nome)'}")
+                    with cols[1]:
+                        st.write(f"Total: R$ {total:.2f}")
+                    with cols[2]:
+                        if st.button("Marcar como pago", key=f"paga_{vid}"):
+                            marcar_venda_como_paga(vid)
+                            st.success(f"Venda #{vid} marcada como paga.")
+                            st.rerun()
+            else:
+                st.info("Nenhum pagamento pendente.")
+        C:\Users\Maria Eduarda\Downloads\SISTEMA_CAIXA_-main (1)\SISTEMA_CAIXA_-main\sistema\relatorios.py
+        # C:\Users\Maria Eduarda\sistema\relatorios.py
+        import streamlit as st
+        import pandas as pd
+        from datetime import date, timedelta
+        from db import listar_vendas_com_itens
+
+        def aba_relatorios():
+            st.header("📊 Relatórios de Vendas")
+
+            # 📅 Filtro de período
+            hoje = date.today()
+            inicio_default = hoje - timedelta(days=7)
+            periodo = st.date_input(
+                "Período",
+                value=(inicio_default, hoje),
+                help="Selecione a data inicial e final para filtrar as vendas."
+            )
+
+        # Aceita tuple/list com 2 datas, 1 data, ou vazio
+            data_ini, data_fim = inicio_default, hoje  # padrão
+            if isinstance(periodo, (list, tuple)):
+                if len(periodo) == 2 and periodo[0] and periodo[1]:
+                    data_ini, data_fim = periodo[0], periodo[1]
+                elif len(periodo) == 1 and periodo[0]:
+                    data_ini = data_fim = periodo[0]
+            elif periodo:  # caso Streamlit retorne um único date (não lista/tupla)
+                data_ini = data_fim = periodo
+
+        # Se o usuário inverter (fim < ini), corrige
+            if data_fim < data_ini:
+                data_ini, data_fim = data_fim, data_ini
+
+
+            # Busca dados
+            vendas = listar_vendas_com_itens()  # [(id, data_venda, total, nome, qtd, valor)]
+            if not vendas:
+                st.info("Nenhuma venda registrada.")
+                return
+
+            # DataFrame
+            df = pd.DataFrame(vendas, columns=[
+                "venda_id", "data_venda", "valor_total_venda",
+                "produto", "quantidade", "valor_unitario"
+            ])
+            # Converte datas e calcula subtotal do item
+            df["data_venda"] = pd.to_datetime(df["data_venda"])
+            df["subtotal_item"] = df["quantidade"] * df["valor_unitario"]
+
+            # Aplica filtro por período (00:00 até 23:59 do dia fim)
+            mask = (df["data_venda"].dt.date >= data_ini) & (df["data_venda"].dt.date <= data_fim)
+            dfp = df.loc[mask].copy()
+
+            if dfp.empty:
+                st.warning("Sem vendas no período selecionado.")
+                return
+
+            # Métricas
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("🧾 Nº de vendas", dfp["venda_id"].nunique())
+            with col_b:
+                st.metric("🛍️ Itens vendidos", int(dfp["quantidade"].sum()))
+            with col_c:
+                st.metric("💰 Faturamento (período)", f"R$ {dfp['subtotal_item'].sum():.2f}")
+
+            st.markdown("### Detalhes por item")
+            df_itens = dfp[["data_venda", "venda_id", "produto", "quantidade", "valor_unitario", "subtotal_item"]]
+            df_itens = df_itens.sort_values(["data_venda", "venda_id"])
+            st.dataframe(
+                df_itens.rename(columns={
+                    "data_venda": "Data",
+                    "venda_id": "Venda",
+                    "produto": "Produto",
+                    "quantidade": "Qtd.",
+                    "valor_unitario": "Vlr Unit.",
+                    "subtotal_item": "Subtotal"
+                }),
+                use_container_width=True
+            )
+
+            st.markdown("### Resumo por produto")
+            resumo = (
+                dfp.groupby("produto", as_index=False)
+                .agg(qtd_total=("quantidade", "sum"),
+                        faturamento=("subtotal_item", "sum"))
+                .sort_values("faturamento", ascending=False)
+            )
+            st.dataframe(resumo.rename(columns={
+                "produto": "Produto",
+                "qtd_total": "Qtd. total",
+                "faturamento": "Faturamento"
+            }), use_container_width=True)
+
+            # Exportar CSV
+            csv = df_itens.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Baixar CSV (itens do período)",
+                data=csv,
+                file_name=f"relatorio_vendas_{data_ini}_a_{data_fim}.csv",
+                mime="text/csv"
+            )
